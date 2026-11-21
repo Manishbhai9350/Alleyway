@@ -45,7 +45,8 @@ if (alley.camera) {
     activeCamera.updateProjectionMatrix();
   }
 
-  activeCamera.position.z -= -2;
+
+  activeCamera.position.z -= innerWidth < 900 ? 6 : 0;
   activeCamera.far = 100;
 
   // controls = new OrbitControls(activeCamera, canvas);
@@ -66,6 +67,8 @@ function animate() {
   if (controls) {
     controls.update(deltaTime);
   }
+
+  Fog?.update(time);
 
   renderer.render(scene, activeCamera);
   requestAnimationFrame(animate);

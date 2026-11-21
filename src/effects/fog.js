@@ -36,6 +36,12 @@ const fragmentShader = /* glsl */ `
   uniform float uEndZ;
   uniform float uEdgeSoftness;
 
+  // Progress-based opacity uniforms (0.0 at uStartZ -> 1.0 at uEndZ)
+  uniform float uProgressStartOpacity;
+  uniform float uProgressEndOpacity;
+  uniform float uProgressCurve;
+  uniform float uProgressWeight;
+
   varying vec2 vUv;
   varying float vSeed;
   varying float vColorMix;
@@ -89,11 +95,14 @@ const fragmentShader = /* glsl */ `
 
     vec2 seedOffset = vec2(vSeed * 17.31, vSeed * 9.17);
     vec2 drift = vec2(
-      uTime * uSpeed * (0.6 + fract(vSeed * 3.1) * 0.8),
-      uTime * uSpeed * 0.25
-    );
+      uTime * uSpeed * sin(0.6 + fract(vSeed * 3.1) * 0.8),
+      uTime * uSpeed * 0.25 + sin(vSeed * 5.1) * 0.15
+    ) * 0.0;
 
     vec2 uv = vUv * uNoiseScale + seedOffset + drift;
+
+    float angle = fbmValue((uv + uTime * .001) * .0001) * 6.28318530718; // 2 * PI
+    uv *= mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
 
     float n1 = (uNoiseMode == 1) ? fbmBillowy(uv) : fbmValue(uv);
     float warpStrength = (uNoiseMode == 1) ? 0.75 : 1.35;
@@ -104,14 +113,23 @@ const fragmentShader = /* glsl */ `
     float upper = clamp(uCloudThreshold + max(0.08, uCloudContrast), uCloudThreshold + 0.05, 0.99);
     float mist = smoothstep(uCloudThreshold, upper, n2);
 
+    // Normalized progress from startZ (0.0) to endZ (1.0) regardless of startZ > endZ or startZ < endZ
+    float denom = uEndZ - uStartZ;
+    float rawProgress = (abs(denom) > 0.0001)
+      ? clamp((vWorldZ - uStartZ) / denom, 0.0, 1.0)
+      : 1.0;
+    float curvedProgress = pow(rawProgress, max(0.05, uProgressCurve));
+    float progressOpacity = mix(uProgressStartOpacity, uProgressEndOpacity, curvedProgress);
+    float progressFactor = mix(1.0, progressOpacity, clamp(uProgressWeight, 0.0, 1.0));
+
     // Smooth fade within the world Z bounds [minZ, maxZ]
     float minZ = min(uStartZ, uEndZ);
     float maxZ = max(uStartZ, uEndZ);
     float soft = max(0.001, uEdgeSoftness);
     float zFade = smoothstep(minZ, minZ + soft, vWorldZ) * (1.0 - smoothstep(maxZ - soft, maxZ, vWorldZ));
 
-    float alpha = mist * radialMask * zFade * uOpacity;
-    if (alpha < 0.002) discard;
+    float alpha = mist * radialMask * progressFactor * uOpacity;
+    if (alpha < 0.01) discard;
 
     float shadeMix = clamp(vColorMix * 0.5 + n2 * 0.65 + (n1 - 0.5) * 0.25, 0.0, 1.0);
     vec3 col = mix(uColorA, uColorB, shadeMix);
@@ -121,31 +139,38 @@ const fragmentShader = /* glsl */ `
 `;
 
 export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
+  const zOffset = 10;
   const params = {
-    baseColor: "#111724",
-    scatterColor: "#3b5978",
-    fogDensity: 0.054 * 0,
+    baseColor: "#0f2028",
+    scatterColor: "#2a8189",
+    fogDensity: 0.049,
     syncBackground: true,
 
     // World Z bounds for the dense fog area
-    startZ: 50.0,
-    endZ: 18,
-    edgeSoftness: 6.0,
+    startZ: 25 + zOffset,
+    endZ: 21 + zOffset,
+    edgeSoftness: 20.0,
+
+    // Progress-based opacity from startZ (0) -> endZ (1)
+    progressWeight: 1.0,
+    progressStartOpacity: 0.15,
+    progressEndOpacity: 1.0,
+    progressCurve: 1.0,
 
     // Dense fog area dimensions & placement
-    areaWidth: 10.0,
-    areaHeight:10.0,
+    areaWidth: 20.0,
+    areaHeight: 20.0,
     centerX: 0.0,
     centerY: 5,
 
     // Plane count, opacity & noise
     planeCount: 90,
-    opacity: 0.190,
-    noiseMode: "billowy",
-    noiseScale: 8,
-    driftSpeed: 0.08,
-    cloudThreshold: 0.18,
-    cloudContrast: 0.42,
+    opacity: 0.75,
+    noiseMode: "valueFbm", // "billowy" or "valueFbm"
+    noiseScale: 1.5,
+    driftSpeed: 0.14,
+    cloudThreshold: 0.31,
+    cloudContrast: 0.41,
     additive: false,
 
     // Debug bounds for the world Z area
@@ -176,6 +201,10 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
       uStartZ: { value: params.startZ },
       uEndZ: { value: params.endZ },
       uEdgeSoftness: { value: params.edgeSoftness },
+      uProgressStartOpacity: { value: params.progressStartOpacity },
+      uProgressEndOpacity: { value: params.progressEndOpacity },
+      uProgressCurve: { value: params.progressCurve },
+      uProgressWeight: { value: params.progressWeight },
     },
   });
 
@@ -189,7 +218,12 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
     }
 
     const count = Math.max(1, params.planeCount);
-    const geometry = new THREE.PlaneGeometry(params.areaWidth, params.areaHeight, 1, 1);
+    const geometry = new THREE.PlaneGeometry(
+      params.areaWidth,
+      params.areaHeight,
+      1,
+      1,
+    );
     const seeds = new Float32Array(count);
     const colorMixes = new Float32Array(count);
 
@@ -205,7 +239,7 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
       dummy.position.set(
         params.centerX + (Math.random() - 0.5) * 1.5,
         params.centerY + (Math.random() - 0.5) * 1.5,
-        z
+        z,
       );
       dummy.rotation.set(0, 0, (Math.random() - 0.5) * 0.4);
       dummy.scale.setScalar(0.95 + Math.random() * 0.25);
@@ -213,18 +247,30 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
 
       fogPlanes.setMatrixAt(i, dummy.matrix);
       seeds[i] = Math.random() * 100.0;
-      colorMixes[i] = THREE.MathUtils.clamp(t * 0.6 + Math.random() * 0.4, 0, 1);
+      colorMixes[i] = THREE.MathUtils.clamp(
+        t * 0.6 + Math.random() * 0.4,
+        0,
+        1,
+      );
     }
 
-    geometry.setAttribute("aSeed", new THREE.InstancedBufferAttribute(seeds, 1));
-    geometry.setAttribute("aColorMix", new THREE.InstancedBufferAttribute(colorMixes, 1));
+    geometry.setAttribute(
+      "aSeed",
+      new THREE.InstancedBufferAttribute(seeds, 1),
+    );
+    geometry.setAttribute(
+      "aColorMix",
+      new THREE.InstancedBufferAttribute(colorMixes, 1),
+    );
     fogPlanes.instanceMatrix.needsUpdate = true;
 
     scene.add(fogPlanes);
   }
 
   // Debug volume box/lines matching [startZ, endZ], areaWidth, areaHeight, centerX, centerY
-  const debugLineMat = new THREE.LineBasicMaterial({ color: params.debugColor });
+  const debugLineMat = new THREE.LineBasicMaterial({
+    color: params.debugColor,
+  });
   const debugLineGeo = new THREE.BufferGeometry();
   const debugLines = new THREE.LineSegments(debugLineGeo, debugLineMat);
   debugLines.name = "DenseFogAreaDebug";
@@ -245,7 +291,6 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
     const z0 = params.startZ;
     const z1 = params.endZ;
 
-    // 12 edges of the world-space fog volume box
     const corners = [
       new THREE.Vector3(x0, y0, z0), // 0
       new THREE.Vector3(x1, y0, z0), // 1
@@ -258,9 +303,30 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
     ];
 
     const edges = [
-      0, 1, 1, 2, 2, 3, 3, 0, // startZ rectangle
-      4, 5, 5, 6, 6, 7, 7, 4, // endZ rectangle
-      0, 4, 1, 5, 2, 6, 3, 7, // connecting rails along Z
+      0,
+      1,
+      1,
+      2,
+      2,
+      3,
+      3,
+      0, // startZ rectangle
+      4,
+      5,
+      5,
+      6,
+      6,
+      7,
+      7,
+      4, // endZ rectangle
+      0,
+      4,
+      1,
+      5,
+      2,
+      6,
+      3,
+      7, // connecting rails along Z
     ];
 
     const positions = new Float32Array(edges.length * 3);
@@ -271,7 +337,10 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
       positions[i * 3 + 2] = v.z;
     });
 
-    debugLineGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    debugLineGeo.setAttribute(
+      "position",
+      new THREE.BufferAttribute(positions, 3),
+    );
     debugLineGeo.computeBoundingSphere();
   }
 
@@ -288,6 +357,10 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
     material.uniforms.uStartZ.value = params.startZ;
     material.uniforms.uEndZ.value = params.endZ;
     material.uniforms.uEdgeSoftness.value = params.edgeSoftness;
+    material.uniforms.uProgressStartOpacity.value = params.progressStartOpacity;
+    material.uniforms.uProgressEndOpacity.value = params.progressEndOpacity;
+    material.uniforms.uProgressCurve.value = params.progressCurve;
+    material.uniforms.uProgressWeight.value = params.progressWeight;
     if (params.syncBackground && scene.background instanceof THREE.Color) {
       scene.background.set(params.baseColor);
     }
@@ -300,7 +373,12 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
     const fogFolder = pane.addFolder({ title: "Fog" });
 
     fogFolder
-      .addBinding(params, "fogDensity", { label: "exp2 density", min: 0, max: 0.25, step: 0.001 })
+      .addBinding(params, "fogDensity", {
+        label: "exp2 density",
+        min: 0,
+        max: 0.25,
+        step: 0.001,
+      })
       .on("change", syncUniforms);
     fogFolder
       .addBinding(params, "baseColor", { label: "base color" })
@@ -317,45 +395,116 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
 
     const areaFolder = fogFolder.addFolder({ title: "Dense Area (World)" });
     areaFolder
-      .addBinding(params, "startZ", { label: "start z", min: 0, max: 50, step: 0.5 })
+      .addBinding(params, "startZ", {
+        label: "start z",
+        min: 0,
+        max: 50,
+        step: 0.5,
+      })
       .on("change", () => {
         syncUniforms();
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "endZ", { label: "end z", min: 0, max: 50, step: 0.5 })
+      .addBinding(params, "endZ", {
+        label: "end z",
+        min: 0,
+        max: 50,
+        step: 0.5,
+      })
       .on("change", () => {
         syncUniforms();
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "areaWidth", { label: "area width", min: 1, max: 10, step: 0.5 })
+      .addBinding(params, "areaWidth", {
+        label: "area width",
+        min: 1,
+        max: 20,
+        step: 0.5,
+      })
       .on("change", () => {
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "areaHeight", { label: "area height", min: 1, max: 10, step: 0.5 })
+      .addBinding(params, "areaHeight", {
+        label: "area height",
+        min: 1,
+        max: 20,
+        step: 0.5,
+      })
       .on("change", () => {
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "centerX", { label: "center x", min: -60, max: 60, step: 0.5 })
+      .addBinding(params, "centerX", {
+        label: "center x",
+        min: -60,
+        max: 60,
+        step: 0.5,
+      })
       .on("change", () => {
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "centerY", { label: "center y", min: -40, max: 60, step: 0.5 })
+      .addBinding(params, "centerY", {
+        label: "center y",
+        min: -40,
+        max: 60,
+        step: 0.5,
+      })
       .on("change", () => {
         rebuildFogPlanes();
         updateDebugLines();
       });
     areaFolder
-      .addBinding(params, "edgeSoftness", { label: "z fade softness", min: 0.5, max: 30, step: 0.5 })
+      .addBinding(params, "edgeSoftness", {
+        label: "z fade softness",
+        min: 0.5,
+        max: 30,
+        step: 0.5,
+      })
+      .on("change", syncUniforms);
+
+    const progressFolder = fogFolder.addFolder({
+      title: "Progress Opacity (startZ -> endZ)",
+    });
+    progressFolder
+      .addBinding(params, "progressWeight", {
+        label: "progress mix",
+        min: 0,
+        max: 1,
+        step: 0.01,
+      })
+      .on("change", syncUniforms);
+    progressFolder
+      .addBinding(params, "progressStartOpacity", {
+        label: "start opacity",
+        min: 0,
+        max: 2,
+        step: 0.01,
+      })
+      .on("change", syncUniforms);
+    progressFolder
+      .addBinding(params, "progressEndOpacity", {
+        label: "end opacity",
+        min: 0,
+        max: 2,
+        step: 0.01,
+      })
+      .on("change", syncUniforms);
+    progressFolder
+      .addBinding(params, "progressCurve", {
+        label: "curve exponent",
+        min: 0.1,
+        max: 4,
+        step: 0.05,
+      })
       .on("change", syncUniforms);
 
     const styleFolder = fogFolder.addFolder({ title: "Dense Fog & Noise" });
@@ -369,27 +518,59 @@ export function SetupFog(scene = new THREE.Scene(), camera, pane = new Pane()) {
       })
       .on("change", syncUniforms);
     styleFolder
-      .addBinding(params, "planeCount", { label: "plane count", min: 1, max: 100, step: 1 })
+      .addBinding(params, "planeCount", {
+        label: "plane count",
+        min: 1,
+        max: 100,
+        step: 1,
+      })
       .on("change", rebuildFogPlanes);
     styleFolder
-      .addBinding(params, "opacity", { label: "opacity", min: 0, max: 0.75, step: 0.005 })
+      .addBinding(params, "opacity", {
+        label: "opacity",
+        min: 0,
+        max: 0.75,
+        step: 0.005,
+      })
       .on("change", syncUniforms);
     styleFolder
-      .addBinding(params, "cloudThreshold", { label: "cloud threshold", min: 0, max: 0.8, step: 0.01 })
+      .addBinding(params, "cloudThreshold", {
+        label: "cloud threshold",
+        min: 0,
+        max: 0.8,
+        step: 0.01,
+      })
       .on("change", syncUniforms);
     styleFolder
-      .addBinding(params, "cloudContrast", { label: "cloud contrast", min: 0.05, max: 0.8, step: 0.01 })
+      .addBinding(params, "cloudContrast", {
+        label: "cloud contrast",
+        min: 0.05,
+        max: 0.8,
+        step: 0.01,
+      })
       .on("change", syncUniforms);
     styleFolder
-      .addBinding(params, "noiseScale", { label: "noise scale", min: 0.5, max: 8, step: 0.1 })
+      .addBinding(params, "noiseScale", {
+        label: "noise scale",
+        min: 0.5,
+        max: 8,
+        step: 0.1,
+      })
       .on("change", syncUniforms);
     styleFolder
-      .addBinding(params, "driftSpeed", { label: "drift speed", min: 0, max: 0.5, step: 0.01 })
+      .addBinding(params, "driftSpeed", {
+        label: "drift speed",
+        min: 0,
+        max: 0.5,
+        step: 0.01,
+      })
       .on("change", syncUniforms);
     styleFolder
       .addBinding(params, "additive", { label: "additive" })
       .on("change", (ev) => {
-        material.blending = ev.value ? THREE.AdditiveBlending : THREE.NormalBlending;
+        material.blending = ev.value
+          ? THREE.AdditiveBlending
+          : THREE.NormalBlending;
         material.needsUpdate = true;
       });
 
